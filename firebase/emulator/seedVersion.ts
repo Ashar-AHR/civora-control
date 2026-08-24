@@ -1,0 +1,1 @@
+export const FOUNDATION_SEED_VERSION = 'M01-SEED-1.0.0';

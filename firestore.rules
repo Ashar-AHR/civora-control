@@ -1,0 +1,215 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function currentUser() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function approvedRole(role) {
+      return role == 'commercial_manager' || role == 'senior_qs';
+    }
+
+    function activeP136User() {
+      return signedIn()
+        && exists(userPath(request.auth.uid))
+        && currentUser().active == true
+        && approvedRole(currentUser().role)
+        && currentUser().projectIds == ['P136'];
+    }
+
+    function isCM() {
+      return activeP136User() && currentUser().role == 'commercial_manager';
+    }
+
+    function bounded(maximum) {
+      return request.query.limit != null && request.query.limit <= maximum;
+    }
+
+    function uuid(value) {
+      return value is string
+        && value.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$');
+    }
+
+    function validUpdateControl() {
+      return request.resource.data.projectId == 'P136'
+        && request.resource.data.version == resource.data.version + 1
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedByUid == request.auth.uid
+        && uuid(request.resource.data.lastMutationId)
+        && request.resource.data.lastMutationId != resource.data.lastMutationId;
+    }
+
+    function auditPath(mutationId) {
+      return /databases/$(database)/documents/projects/P136/auditEvents/$(mutationId);
+    }
+
+    function validAuditCompanion(entityType, entityId) {
+      let audit = getAfter(auditPath(request.resource.data.lastMutationId)).data;
+      return audit.projectId == 'P136'
+        && audit.mutationId == request.resource.data.lastMutationId
+        && audit.actorUid == request.auth.uid
+        && audit.occurredAt == request.time
+        && audit.entityType == entityType
+        && audit.entityId == entityId
+        && audit.beforeVersion == resource.data.version
+        && audit.afterVersion == request.resource.data.version;
+    }
+
+    match /users/{uid} {
+      allow get: if activeP136User() && (request.auth.uid == uid || isCM());
+      allow list: if isCM() && bounded(100) && resource.data.projectIds == ['P136'];
+      allow create, update, delete: if false;
+    }
+
+    match /projects/P136 {
+      allow get: if activeP136User();
+      allow list, create, delete: if false;
+      allow update: if isCM()
+        && validUpdateControl()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'vatRateBp', 'version', 'updatedAt', 'updatedByUid', 'lastMutationId'
+        ])
+        && request.resource.data.vatRateBp is int
+        && request.resource.data.vatRateBp >= 0
+        && request.resource.data.vatRateBp <= 10000
+        && validAuditCompanion('project', 'P136');
+
+      match /systemSettings/core {
+        allow get: if activeP136User();
+        allow list, create, delete: if false;
+        allow update: if isCM()
+          && validUpdateControl()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'budgetWarningThresholdBp', 'searchPrefixLimit', 'externalReferenceLimit',
+            'version', 'updatedAt', 'updatedByUid', 'lastMutationId'
+          ])
+          && request.resource.data.schemaVersion == resource.data.schemaVersion
+          && request.resource.data.calculationVersion == resource.data.calculationVersion
+          && request.resource.data.enabledModules == resource.data.enabledModules
+          && request.resource.data.vatRateBp == resource.data.vatRateBp
+          && request.resource.data.budgetWarningThresholdBp is int
+          && request.resource.data.budgetWarningThresholdBp >= 0
+          && request.resource.data.budgetWarningThresholdBp <= 10000
+          && request.resource.data.searchPrefixLimit is int
+          && request.resource.data.searchPrefixLimit >= 1
+          && request.resource.data.searchPrefixLimit <= 20
+          && request.resource.data.externalReferenceLimit is int
+          && request.resource.data.externalReferenceLimit >= 1
+          && request.resource.data.externalReferenceLimit <= 500
+          && validAuditCompanion('systemSettings', 'core');
+      }
+
+      match /auditEvents/{mutationId} {
+        allow get: if activeP136User();
+        allow list: if activeP136User() && bounded(100);
+        allow update, delete: if false;
+        allow create: if activeP136User()
+          && request.resource.data.keys().hasOnly([
+            'projectId', 'mutationId', 'actorUid', 'occurredAt', 'reason',
+            'entityType', 'entityId', 'actionCode', 'beforeVersion', 'afterVersion',
+            'changedFields', 'relatedIds'
+          ])
+          && request.resource.data.projectId == 'P136'
+          && request.resource.data.mutationId == mutationId
+          && uuid(mutationId)
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.occurredAt == request.time
+          && request.resource.data.beforeVersion is int
+          && request.resource.data.afterVersion == request.resource.data.beforeVersion + 1
+          && validFoundationAuditTarget();
+      }
+
+      match /entityVersions/{versionId} {
+        allow get: if activeP136User();
+        allow list: if activeP136User() && bounded(100);
+        allow create, update, delete: if false;
+      }
+
+      match /workItems/{workItemId} {
+        allow get: if activeP136User()
+          && (isCM() || resource.data.assignedToUid == request.auth.uid);
+        allow list: if activeP136User()
+          && bounded(100)
+          && (isCM() || resource.data.assignedToUid == request.auth.uid);
+        allow create, update, delete: if false;
+      }
+
+      match /uniqueKeys/{keyId} {
+        allow get: if activeP136User();
+        allow list: if activeP136User() && bounded(100);
+        allow update, delete: if false;
+        allow create: if activeP136User()
+          && request.resource.data.keys().hasOnly([
+            'projectId', 'namespace', 'normalizedKey', 'targetCollection', 'targetId',
+            'reservedNumber', 'counterKey', 'state', 'createdAt', 'createdByUid', 'lastMutationId'
+          ])
+          && request.resource.data.projectId == 'P136'
+          && request.resource.data.state == 'RESERVED'
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.createdByUid == request.auth.uid
+          && uuid(request.resource.data.lastMutationId)
+          && getAfter(/databases/$(database)/documents/projects/P136/sequenceCounters/$(request.resource.data.counterKey)).data.lastMutationId == request.resource.data.lastMutationId
+          && getAfter(/databases/$(database)/documents/projects/P136/sequenceCounters/$(request.resource.data.counterKey)).data.targetReservationId == keyId
+          && getAfter(/databases/$(database)/documents/projects/P136/sequenceCounters/$(request.resource.data.counterKey)).data.nextNumber == request.resource.data.reservedNumber + 1;
+      }
+
+      match /sequenceCounters/{counterId} {
+        allow get: if activeP136User();
+        allow list, create, delete: if false;
+        allow update: if activeP136User()
+          && validUpdateControl()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'nextNumber', 'targetReservationId', 'version', 'updatedAt', 'updatedByUid', 'lastMutationId'
+          ])
+          && request.resource.data.nextNumber == resource.data.nextNumber + 1
+          && request.resource.data.targetReservationId is string
+          && getAfter(/databases/$(database)/documents/projects/P136/uniqueKeys/$(request.resource.data.targetReservationId)).data.counterKey == counterId
+          && getAfter(/databases/$(database)/documents/projects/P136/uniqueKeys/$(request.resource.data.targetReservationId)).data.lastMutationId == request.resource.data.lastMutationId
+          && validAuditCompanion('sequenceCounter', counterId);
+      }
+
+      match /{document=**} {
+        allow read, write: if false;
+      }
+    }
+
+    match /projects/{otherProject}/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function validFoundationAuditTarget() {
+      let data = request.resource.data;
+      return (
+        data.entityType == 'systemSettings'
+        && data.entityId == 'core'
+        && getAfter(/databases/$(database)/documents/projects/P136/systemSettings/core).data.lastMutationId == data.mutationId
+        && get(/databases/$(database)/documents/projects/P136/systemSettings/core).data.version == data.beforeVersion
+        && getAfter(/databases/$(database)/documents/projects/P136/systemSettings/core).data.version == data.afterVersion
+      ) || (
+        data.entityType == 'project'
+        && data.entityId == 'P136'
+        && getAfter(/databases/$(database)/documents/projects/P136).data.lastMutationId == data.mutationId
+        && get(/databases/$(database)/documents/projects/P136).data.version == data.beforeVersion
+        && getAfter(/databases/$(database)/documents/projects/P136).data.version == data.afterVersion
+      ) || (
+        data.entityType == 'sequenceCounter'
+        && getAfter(/databases/$(database)/documents/projects/P136/sequenceCounters/$(data.entityId)).data.lastMutationId == data.mutationId
+        && get(/databases/$(database)/documents/projects/P136/sequenceCounters/$(data.entityId)).data.version == data.beforeVersion
+        && getAfter(/databases/$(database)/documents/projects/P136/sequenceCounters/$(data.entityId)).data.version == data.afterVersion
+      );
+    }
+  }
+}
